@@ -282,9 +282,9 @@ The tool includes built-in rate limit handling:
 
 | Action | Delay |
 |--------|-------|
-| Between message deletions | 1.5 seconds |
+| Between message deletions | 6 seconds |
 | Between reaction removals | 600ms |
-| Between search API calls | 75 seconds |
+| Between search API calls | 90 seconds |
 | Between pagination batches | 1.5 seconds |
 | Rate limit retry | Automatic with `Retry-After` parsing, up to 5 retries |
 
