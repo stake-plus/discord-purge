@@ -21,11 +21,15 @@ import (
 const (
 	apiBase = "https://discord.com/api/v9"
 
-	// Conservative rate limit delays
-	searchDelay   = 2 * time.Second        // Between search API calls (strict limit)
-	deleteDelay   = 400 * time.Millisecond // Between delete calls
-	reactionDelay = 300 * time.Millisecond // Between reaction removal calls
-	batchDelay    = 1 * time.Second        // Between pagination batches
+	// Conservative pacing to reduce transient 400/429 churn.
+	searchDelay          = 3 * time.Second
+	deleteDelay          = 700 * time.Millisecond
+	reactionDelay        = 600 * time.Millisecond
+	batchDelay           = 1500 * time.Millisecond
+	threadDiscoveryDelay = 800 * time.Millisecond
+	errorBackoffDelay    = 1200 * time.Millisecond
+
+	maxSearchIndexWaits = 40
 )
 
 // Channel types
@@ -118,6 +122,11 @@ type RateLimitResponse struct {
 	Global     bool    `json:"global"`
 }
 
+type APIError struct {
+	Message string `json:"message"`
+	Code    int    `json:"code"`
+}
+
 type Relationship struct {
 	ID   string `json:"id"`
 	Type int    `json:"type"`
@@ -198,6 +207,65 @@ func (c *DiscordClient) requestWithBody(method, path, jsonBody string) ([]byte, 
 	}
 
 	return nil, 429, fmt.Errorf("still rate limited after 5 retries")
+}
+
+func parseAPIError(body []byte) APIError {
+	var apiErr APIError
+	if err := json.Unmarshal(body, &apiErr); err != nil {
+		return APIError{}
+	}
+	return apiErr
+}
+
+func formatAPIError(body []byte) string {
+	apiErr := parseAPIError(body)
+	if apiErr.Message == "" && apiErr.Code == 0 {
+		return strings.TrimSpace(string(body))
+	}
+	if apiErr.Code == 0 {
+		return apiErr.Message
+	}
+	if apiErr.Message == "" {
+		return fmt.Sprintf("code %d", apiErr.Code)
+	}
+	return fmt.Sprintf("code %d: %s", apiErr.Code, apiErr.Message)
+}
+
+func olderSnowflakeID(currentOldest, candidate string) string {
+	if candidate == "" {
+		return currentOldest
+	}
+	if currentOldest == "" {
+		return candidate
+	}
+
+	cur, curErr := strconv.ParseUint(currentOldest, 10, 64)
+	cand, candErr := strconv.ParseUint(candidate, 10, 64)
+	if curErr == nil && candErr == nil {
+		if cand < cur {
+			return candidate
+		}
+		return currentOldest
+	}
+
+	if len(candidate) < len(currentOldest) {
+		return candidate
+	}
+	if len(candidate) > len(currentOldest) {
+		return currentOldest
+	}
+	if candidate < currentOldest {
+		return candidate
+	}
+	return currentOldest
+}
+
+func previousSnowflakeID(id string) string {
+	n, err := strconv.ParseUint(id, 10, 64)
+	if err != nil || n == 0 {
+		return id
+	}
+	return strconv.FormatUint(n-1, 10)
 }
 
 // =============================================================================
@@ -376,6 +444,53 @@ func (c *DiscordClient) GetArchivedPrivateThreads(channelID string) ([]Channel, 
 	return c.getArchivedThreads(channelID, "private")
 }
 
+// GetJoinedArchivedPrivateThreads fetches archived private threads that the
+// current user has joined. Some guilds only expose private archives here.
+func (c *DiscordClient) GetJoinedArchivedPrivateThreads(channelID string) ([]Channel, error) {
+	var allThreads []Channel
+	before := ""
+
+	for {
+		path := fmt.Sprintf("/channels/%s/users/@me/threads/archived/private?limit=100", channelID)
+		if before != "" {
+			path += "&before=" + before
+		}
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			return allThreads, fmt.Errorf("fetching joined archived private threads: %w", err)
+		}
+		if status == 403 || status == 400 || status == 404 {
+			break // No access or endpoint not applicable
+		}
+		if status != 200 {
+			return allThreads, fmt.Errorf("fetching joined archived private threads: HTTP %d", status)
+		}
+
+		var result ThreadListResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return allThreads, fmt.Errorf("parsing joined archived private threads: %w", err)
+		}
+
+		allThreads = append(allThreads, result.Threads...)
+
+		if !result.HasMore || len(result.Threads) == 0 {
+			break
+		}
+
+		lastThread := result.Threads[len(result.Threads)-1]
+		if lastThread.ThreadMetadata != nil && lastThread.ThreadMetadata.ArchiveTimestamp != "" {
+			before = lastThread.ThreadMetadata.ArchiveTimestamp
+		} else {
+			break
+		}
+
+		time.Sleep(batchDelay)
+	}
+
+	return allThreads, nil
+}
+
 func (c *DiscordClient) getArchivedThreads(channelID, kind string) ([]Channel, error) {
 	var allThreads []Channel
 	before := ""
@@ -451,6 +566,8 @@ func (c *DiscordClient) discoverAllGuildChannelsAndThreads(guildID string) []str
 			parentChannelIDs = append(parentChannelIDs, ch.ID)
 		case ChannelTypeGuildVoice, ChannelTypeGuildStageVoice:
 			addChannel(ch.ID)
+		case ChannelTypeGuildNewsThread, ChannelTypeGuildPublicThread, ChannelTypeGuildPrivateThread:
+			addChannel(ch.ID)
 		case ChannelTypeGuildForum, ChannelTypeGuildMedia:
 			// Forum/media channels don't have messages directly,
 			// but their threads (posts) do. We'll discover threads below.
@@ -482,7 +599,14 @@ func (c *DiscordClient) discoverAllGuildChannelsAndThreads(guildID string) []str
 			}
 		}
 
-		time.Sleep(500 * time.Millisecond) // small delay between parent channels
+		joinedPrivThreads, err := c.GetJoinedArchivedPrivateThreads(parentID)
+		if err == nil {
+			for _, t := range joinedPrivThreads {
+				addChannel(t.ID)
+			}
+		}
+
+		time.Sleep(threadDiscoveryDelay)
 	}
 
 	return channelIDs
@@ -536,10 +660,15 @@ func LoadDataPackageChannelIDs(packagePath string) ([]string, error) {
 // and voice text chat.
 func (c *DiscordClient) SearchGuildMessages(guildID string) (int, error) {
 	totalDeleted := 0
-	staleCount := 0
+	indexWaitCount := 0
+	maxID := ""
+	skippedMessageIDs := make(map[string]bool)
 
 	for {
 		path := fmt.Sprintf("/guilds/%s/messages/search?author_id=%s&include_nsfw=true&sort_by=timestamp&sort_order=desc", guildID, c.userID)
+		if maxID != "" {
+			path += "&max_id=" + maxID
+		}
 
 		body, status, err := c.request("GET", path)
 		if err != nil {
@@ -547,10 +676,15 @@ func (c *DiscordClient) SearchGuildMessages(guildID string) (int, error) {
 		}
 
 		if status == 202 {
-			fmt.Printf("   ⏳ Search index building, waiting...\n")
+			indexWaitCount++
+			if indexWaitCount >= maxSearchIndexWaits {
+				return totalDeleted, fmt.Errorf("search index not ready after %d retries", maxSearchIndexWaits)
+			}
+			fmt.Printf("   ⏳ Search index building, waiting (%d/%d)...\n", indexWaitCount, maxSearchIndexWaits)
 			time.Sleep(3 * time.Second)
 			continue
 		}
+		indexWaitCount = 0
 
 		if status == 403 {
 			fmt.Printf("   ⚠️  No permission to search this server, skipping.\n")
@@ -565,6 +699,16 @@ func (c *DiscordClient) SearchGuildMessages(guildID string) (int, error) {
 		if err := json.Unmarshal(body, &result); err != nil {
 			return totalDeleted, fmt.Errorf("parsing search results: %w", err)
 		}
+		if result.Retry {
+			indexWaitCount++
+			if indexWaitCount >= maxSearchIndexWaits {
+				return totalDeleted, fmt.Errorf("search index requested retry too many times")
+			}
+			fmt.Printf("   ⏳ Search requested retry, waiting (%d/%d)...\n", indexWaitCount, maxSearchIndexWaits)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		indexWaitCount = 0
 
 		if result.TotalResults == 0 || len(result.Messages) == 0 {
 			break
@@ -573,22 +717,54 @@ func (c *DiscordClient) SearchGuildMessages(guildID string) (int, error) {
 		fmt.Printf("   📊 %d messages remaining...\n", result.TotalResults)
 
 		deletedThisRound := 0
+		oldestHitID := ""
+		seenInThisPage := make(map[string]bool)
 
 		for _, msgGroup := range result.Messages {
 			for _, msg := range msgGroup {
 				if msg.Author.ID == c.userID && msg.Hit {
-					_, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", msg.ChannelID, msg.ID))
+					oldestHitID = olderSnowflakeID(oldestHitID, msg.ID)
+
+					if msg.ID == "" || seenInThisPage[msg.ID] || skippedMessageIDs[msg.ID] {
+						continue
+					}
+					seenInThisPage[msg.ID] = true
+
+					if msg.ChannelID == "" {
+						skippedMessageIDs[msg.ID] = true
+						continue
+					}
+
+					delBody, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", msg.ChannelID, msg.ID))
 					if err != nil {
 						fmt.Printf("   ⚠️  Failed to delete message %s: %v\n", msg.ID, err)
+						time.Sleep(errorBackoffDelay)
 					} else if delStatus == 204 || delStatus == 200 {
 						totalDeleted++
 						deletedThisRound++
 					} else if delStatus == 404 {
 						deletedThisRound++
+						skippedMessageIDs[msg.ID] = true
 					} else if delStatus == 403 {
 						fmt.Printf("   ⚠️  Cannot delete message %s (no permission)\n", msg.ID)
+						skippedMessageIDs[msg.ID] = true
+					} else if delStatus == 400 {
+						detail := formatAPIError(delBody)
+						if detail != "" {
+							fmt.Printf("   ⚠️  Cannot delete message %s (HTTP 400, %s)\n", msg.ID, detail)
+						} else {
+							fmt.Printf("   ⚠️  Cannot delete message %s (HTTP 400)\n", msg.ID)
+						}
+						skippedMessageIDs[msg.ID] = true
+						time.Sleep(errorBackoffDelay)
 					} else {
-						fmt.Printf("   ⚠️  Unexpected status %d deleting message %s\n", delStatus, msg.ID)
+						detail := formatAPIError(delBody)
+						if detail != "" {
+							fmt.Printf("   ⚠️  Unexpected status %d deleting message %s (%s)\n", delStatus, msg.ID, detail)
+						} else {
+							fmt.Printf("   ⚠️  Unexpected status %d deleting message %s\n", delStatus, msg.ID)
+						}
+						time.Sleep(errorBackoffDelay)
 					}
 
 					time.Sleep(deleteDelay)
@@ -596,30 +772,73 @@ func (c *DiscordClient) SearchGuildMessages(guildID string) (int, error) {
 			}
 		}
 
+		if oldestHitID == "" {
+			break
+		}
+
+		nextMaxID := previousSnowflakeID(oldestHitID)
+		if nextMaxID == maxID {
+			break
+		}
+		maxID = nextMaxID
+
 		if deletedThisRound == 0 {
-			staleCount++
-			if staleCount >= 3 {
-				fmt.Printf("   ⚠️  Unable to delete remaining messages (may lack permissions). Moving on.\n")
-				break
-			}
-		} else {
-			staleCount = 0
+			fmt.Printf("   ⚠️  No deletions in this page; continuing deeper into older history.\n")
 		}
 
 		time.Sleep(searchDelay)
 	}
 
+	// Discord search can occasionally miss old indexed content. If a guild-level
+	// search found nothing, do an exhaustive channel-by-channel history walk.
+	if totalDeleted == 0 {
+		totalDeleted += c.deepScanGuildMessages(guildID)
+	}
+
 	return totalDeleted, nil
+}
+
+func (c *DiscordClient) deepScanGuildMessages(guildID string) int {
+	channelIDs := c.discoverAllGuildChannelsAndThreads(guildID)
+	if len(channelIDs) == 0 {
+		return 0
+	}
+
+	fmt.Printf("   🔁 Running exhaustive channel scan (%d channels/threads)...\n", len(channelIDs))
+
+	totalDeleted := 0
+	for i, chID := range channelIDs {
+		count, err := c.iterateAndDeleteChannel(chID)
+		if err != nil {
+			continue
+		}
+		totalDeleted += count
+		if count > 0 {
+			fmt.Printf("      ✅ Deleted %d messages in deep scan channel %d/%d\n", count, i+1, len(channelIDs))
+		}
+		time.Sleep(batchDelay)
+	}
+
+	if totalDeleted > 0 {
+		fmt.Printf("   ✅ Deep scan recovered %d additional messages.\n", totalDeleted)
+	}
+
+	return totalDeleted
 }
 
 // SearchDMMessages uses Discord's search API to find and delete all messages
 // in a DM or group DM channel.
 func (c *DiscordClient) SearchDMMessages(channelID string) (int, error) {
 	totalDeleted := 0
-	staleCount := 0
+	indexWaitCount := 0
+	maxID := ""
+	skippedMessageIDs := make(map[string]bool)
 
 	for {
-		path := fmt.Sprintf("/channels/%s/messages/search?author_id=%s", channelID, c.userID)
+		path := fmt.Sprintf("/channels/%s/messages/search?author_id=%s&sort_by=timestamp&sort_order=desc", channelID, c.userID)
+		if maxID != "" {
+			path += "&max_id=" + maxID
+		}
 
 		body, status, err := c.request("GET", path)
 		if err != nil {
@@ -627,18 +846,26 @@ func (c *DiscordClient) SearchDMMessages(channelID string) (int, error) {
 		}
 
 		if status == 202 {
-			fmt.Printf("   ⏳ Search index building, waiting...\n")
+			indexWaitCount++
+			if indexWaitCount >= maxSearchIndexWaits {
+				return totalDeleted, fmt.Errorf("search index not ready after %d retries", maxSearchIndexWaits)
+			}
+			fmt.Printf("   ⏳ Search index building, waiting (%d/%d)...\n", indexWaitCount, maxSearchIndexWaits)
 			time.Sleep(3 * time.Second)
 			continue
 		}
+		indexWaitCount = 0
 
-		if status == 403 || status == 400 {
-			fallbackCount, _ := c.iterateAndDeleteChannel(channelID)
-			return totalDeleted + fallbackCount, nil
+		if status == 403 || status == 400 || status == 404 {
+			fallbackCount, fallbackErr := c.iterateAndDeleteChannel(channelID)
+			return totalDeleted + fallbackCount, fallbackErr
 		}
 
 		if status != 200 {
-			fallbackCount, _ := c.iterateAndDeleteChannel(channelID)
+			fallbackCount, fallbackErr := c.iterateAndDeleteChannel(channelID)
+			if fallbackErr != nil {
+				return totalDeleted + fallbackCount, fmt.Errorf("search returned HTTP %d and fallback failed: %w", status, fallbackErr)
+			}
 			return totalDeleted + fallbackCount, nil
 		}
 
@@ -646,6 +873,16 @@ func (c *DiscordClient) SearchDMMessages(channelID string) (int, error) {
 		if err := json.Unmarshal(body, &result); err != nil {
 			return totalDeleted, fmt.Errorf("parsing search results: %w", err)
 		}
+		if result.Retry {
+			indexWaitCount++
+			if indexWaitCount >= maxSearchIndexWaits {
+				return totalDeleted, fmt.Errorf("search index requested retry too many times")
+			}
+			fmt.Printf("   ⏳ Search requested retry, waiting (%d/%d)...\n", indexWaitCount, maxSearchIndexWaits)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		indexWaitCount = 0
 
 		if result.TotalResults == 0 || len(result.Messages) == 0 {
 			break
@@ -654,20 +891,49 @@ func (c *DiscordClient) SearchDMMessages(channelID string) (int, error) {
 		fmt.Printf("   📊 %d messages remaining...\n", result.TotalResults)
 
 		deletedThisRound := 0
+		oldestHitID := ""
+		seenInThisPage := make(map[string]bool)
 
 		for _, msgGroup := range result.Messages {
 			for _, msg := range msgGroup {
 				if msg.Author.ID == c.userID && msg.Hit {
-					_, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", channelID, msg.ID))
+					oldestHitID = olderSnowflakeID(oldestHitID, msg.ID)
+
+					if msg.ID == "" || seenInThisPage[msg.ID] || skippedMessageIDs[msg.ID] {
+						continue
+					}
+					seenInThisPage[msg.ID] = true
+
+					delBody, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", channelID, msg.ID))
 					if err != nil {
 						fmt.Printf("   ⚠️  Failed to delete message %s: %v\n", msg.ID, err)
+						time.Sleep(errorBackoffDelay)
 					} else if delStatus == 204 || delStatus == 200 {
 						totalDeleted++
 						deletedThisRound++
 					} else if delStatus == 404 {
 						deletedThisRound++
+						skippedMessageIDs[msg.ID] = true
+					} else if delStatus == 403 {
+						skippedMessageIDs[msg.ID] = true
+						fmt.Printf("   ⚠️  Cannot delete message %s (no permission)\n", msg.ID)
+					} else if delStatus == 400 {
+						detail := formatAPIError(delBody)
+						if detail != "" {
+							fmt.Printf("   ⚠️  Cannot delete message %s (HTTP 400, %s)\n", msg.ID, detail)
+						} else {
+							fmt.Printf("   ⚠️  Cannot delete message %s (HTTP 400)\n", msg.ID)
+						}
+						skippedMessageIDs[msg.ID] = true
+						time.Sleep(errorBackoffDelay)
 					} else {
-						fmt.Printf("   ⚠️  Unexpected status %d deleting message %s\n", delStatus, msg.ID)
+						detail := formatAPIError(delBody)
+						if detail != "" {
+							fmt.Printf("   ⚠️  Unexpected status %d deleting message %s (%s)\n", delStatus, msg.ID, detail)
+						} else {
+							fmt.Printf("   ⚠️  Unexpected status %d deleting message %s\n", delStatus, msg.ID)
+						}
+						time.Sleep(errorBackoffDelay)
 					}
 
 					time.Sleep(deleteDelay)
@@ -675,14 +941,18 @@ func (c *DiscordClient) SearchDMMessages(channelID string) (int, error) {
 			}
 		}
 
+		if oldestHitID == "" {
+			break
+		}
+
+		nextMaxID := previousSnowflakeID(oldestHitID)
+		if nextMaxID == maxID {
+			break
+		}
+		maxID = nextMaxID
+
 		if deletedThisRound == 0 {
-			staleCount++
-			if staleCount >= 3 {
-				fmt.Printf("   ⚠️  Unable to delete remaining messages. Moving on.\n")
-				break
-			}
-		} else {
-			staleCount = 0
+			fmt.Printf("   ⚠️  No deletions in this page; continuing deeper into older history.\n")
 		}
 
 		time.Sleep(searchDelay)

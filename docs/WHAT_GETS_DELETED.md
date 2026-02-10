@@ -35,8 +35,9 @@ currently a member of.
 - All threads — public, private, active, and archived
 
 **How it works:** Uses Discord's search API to find all messages authored by you
-across the entire server in a single query. This is the most efficient method and
-catches messages in every channel type, including threads and archived content.
+across the server, paginating backward by message ID to reach older history. If
+guild-level search returns no results, it falls back to an exhaustive
+channel/thread history walk.
 
 **Limitations:**
 - Only covers servers you are **currently a member of**. If you left a server,

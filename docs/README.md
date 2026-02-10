@@ -251,8 +251,9 @@ The tool runs in four phases:
 
 ### Phase 1 — Server Messages
 Iterates every server you are a member of and uses Discord's search API to find
-and delete every message you have authored. One search query covers all channel
-types in the server (text, voice, threads, forums, etc.).
+and delete every message you have authored. The search pass paginates backward
+by message ID to keep moving into older history. If a guild-level search returns
+nothing, it falls back to an exhaustive channel/thread history walk.
 
 ### Phase 2a — Open DMs
 Fetches all DM and group DM channels currently visible in your DM list, then
@@ -281,10 +282,10 @@ The tool includes built-in rate limit handling:
 
 | Action | Delay |
 |--------|-------|
-| Between message deletions | 400ms |
-| Between reaction removals | 300ms |
-| Between search API calls | 2 seconds |
-| Between pagination batches | 1 second |
+| Between message deletions | 700ms |
+| Between reaction removals | 600ms |
+| Between search API calls | 3 seconds |
+| Between pagination batches | 1.5 seconds |
 | Rate limit retry | Automatic with `Retry-After` parsing, up to 5 retries |
 
 ---
