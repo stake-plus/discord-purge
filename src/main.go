@@ -1,0 +1,1234 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// =============================================================================
+// Discord API constants and types
+// =============================================================================
+
+const (
+	apiBase = "https://discord.com/api/v9"
+
+	// Conservative rate limit delays
+	searchDelay   = 2 * time.Second        // Between search API calls (strict limit)
+	deleteDelay   = 400 * time.Millisecond // Between delete calls
+	reactionDelay = 300 * time.Millisecond // Between reaction removal calls
+	batchDelay    = 1 * time.Second        // Between pagination batches
+)
+
+// Channel types
+const (
+	ChannelTypeGuildText          = 0
+	ChannelTypeDM                 = 1
+	ChannelTypeGuildVoice         = 2
+	ChannelTypeGroupDM            = 3
+	ChannelTypeGuildCategory      = 4
+	ChannelTypeGuildNews          = 5
+	ChannelTypeGuildNewsThread    = 10
+	ChannelTypeGuildPublicThread  = 11
+	ChannelTypeGuildPrivateThread = 12
+	ChannelTypeGuildStageVoice    = 13
+	ChannelTypeGuildForum         = 15
+	ChannelTypeGuildMedia         = 16
+)
+
+// Relationship types
+const (
+	RelationshipFriend      = 1
+	RelationshipBlocked     = 2
+	RelationshipIncomingReq = 3
+	RelationshipOutgoingReq = 4
+	RelationshipImplicit    = 5
+	RelationshipSuggestion  = 6
+)
+
+// DiscordClient handles all Discord API interactions via REST (no WebSocket).
+type DiscordClient struct {
+	token      string
+	httpClient *http.Client
+	userID     string
+	username   string
+}
+
+type User struct {
+	ID            string `json:"id"`
+	Username      string `json:"username"`
+	Discriminator string `json:"discriminator"`
+}
+
+type Guild struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type Channel struct {
+	ID             string      `json:"id"`
+	Type           int         `json:"type"`
+	Name           string      `json:"name"`
+	GuildID        string      `json:"guild_id"`
+	Recipients     []User      `json:"recipients"`
+	ThreadMetadata *ThreadMeta `json:"thread_metadata,omitempty"`
+}
+
+type ThreadMeta struct {
+	Archived         bool   `json:"archived"`
+	ArchiveTimestamp string `json:"archive_timestamp"`
+}
+
+type Message struct {
+	ID        string     `json:"id"`
+	Author    User       `json:"author"`
+	ChannelID string     `json:"channel_id"`
+	Hit       bool       `json:"hit,omitempty"`
+	Reactions []Reaction `json:"reactions,omitempty"`
+}
+
+type Reaction struct {
+	Count int       `json:"count"`
+	Me    bool      `json:"me"`
+	Emoji EmojiInfo `json:"emoji"`
+}
+
+type EmojiInfo struct {
+	ID   *string `json:"id"`   // nil for unicode emoji, snowflake string for custom
+	Name string  `json:"name"` // unicode character or custom emoji name
+}
+
+type SearchResult struct {
+	TotalResults int         `json:"total_results"`
+	Messages     [][]Message `json:"messages"`
+	Retry        bool        `json:"retry"`
+}
+
+type RateLimitResponse struct {
+	Message    string  `json:"message"`
+	RetryAfter float64 `json:"retry_after"`
+	Global     bool    `json:"global"`
+}
+
+type Relationship struct {
+	ID   string `json:"id"`
+	Type int    `json:"type"`
+	User User   `json:"user"`
+}
+
+type ThreadListResponse struct {
+	Threads []Channel `json:"threads"`
+	HasMore bool      `json:"has_more"`
+}
+
+// =============================================================================
+// HTTP layer with automatic rate-limit handling
+// =============================================================================
+
+func NewDiscordClient(token string) *DiscordClient {
+	return &DiscordClient{
+		token: token,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+func (c *DiscordClient) request(method, path string) ([]byte, int, error) {
+	return c.requestWithBody(method, path, "")
+}
+
+func (c *DiscordClient) requestWithBody(method, path, jsonBody string) ([]byte, int, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		var bodyReader io.Reader
+		if jsonBody != "" {
+			bodyReader = strings.NewReader(jsonBody)
+		}
+
+		req, err := http.NewRequest(method, apiBase+path, bodyReader)
+		if err != nil {
+			return nil, 0, fmt.Errorf("creating request: %w", err)
+		}
+
+		req.Header.Set("Authorization", c.token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, 0, fmt.Errorf("executing request: %w", err)
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return body, resp.StatusCode, nil
+		}
+
+		if resp.StatusCode == 429 {
+			waitTime := 5.0
+
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if parsed, err := strconv.ParseFloat(ra, 64); err == nil {
+					waitTime = parsed
+				}
+			}
+
+			var rl RateLimitResponse
+			if json.Unmarshal(body, &rl) == nil && rl.RetryAfter > 0 {
+				waitTime = rl.RetryAfter
+			}
+
+			waitTime += 0.5
+			fmt.Printf("   ⏳ Rate limited, waiting %.1f seconds (attempt %d/5)...\n", waitTime, attempt+1)
+			time.Sleep(time.Duration(waitTime*1000) * time.Millisecond)
+			continue
+		}
+
+		return body, resp.StatusCode, nil
+	}
+
+	return nil, 429, fmt.Errorf("still rate limited after 5 retries")
+}
+
+// =============================================================================
+// Discord API methods — Authentication & Discovery
+// =============================================================================
+
+func (c *DiscordClient) Authenticate() error {
+	body, status, err := c.request("GET", "/users/@me")
+	if err != nil {
+		return fmt.Errorf("authentication request failed: %w", err)
+	}
+
+	if status == 401 {
+		return fmt.Errorf("invalid token — authentication failed (HTTP 401)")
+	}
+	if status != 200 {
+		return fmt.Errorf("unexpected status %d: %s", status, string(body))
+	}
+
+	var user User
+	if err := json.Unmarshal(body, &user); err != nil {
+		return fmt.Errorf("parsing user info: %w", err)
+	}
+
+	c.userID = user.ID
+	c.username = user.Username
+	return nil
+}
+
+func (c *DiscordClient) GetAllGuilds() ([]Guild, error) {
+	var allGuilds []Guild
+	afterID := ""
+
+	for {
+		path := "/users/@me/guilds?limit=200"
+		if afterID != "" {
+			path += "&after=" + afterID
+		}
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			return allGuilds, fmt.Errorf("fetching guilds: %w", err)
+		}
+		if status != 200 {
+			return allGuilds, fmt.Errorf("fetching guilds: HTTP %d — %s", status, string(body))
+		}
+
+		var guilds []Guild
+		if err := json.Unmarshal(body, &guilds); err != nil {
+			return allGuilds, fmt.Errorf("parsing guilds: %w", err)
+		}
+
+		if len(guilds) == 0 {
+			break
+		}
+
+		allGuilds = append(allGuilds, guilds...)
+		afterID = guilds[len(guilds)-1].ID
+
+		if len(guilds) < 200 {
+			break
+		}
+
+		time.Sleep(batchDelay)
+	}
+
+	return allGuilds, nil
+}
+
+func (c *DiscordClient) GetDMChannels() ([]Channel, error) {
+	body, status, err := c.request("GET", "/users/@me/channels")
+	if err != nil {
+		return nil, fmt.Errorf("fetching DM channels: %w", err)
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("fetching DM channels: HTTP %d — %s", status, string(body))
+	}
+
+	var channels []Channel
+	if err := json.Unmarshal(body, &channels); err != nil {
+		return nil, fmt.Errorf("parsing DM channels: %w", err)
+	}
+
+	return channels, nil
+}
+
+func (c *DiscordClient) GetRelationships() ([]Relationship, error) {
+	body, status, err := c.request("GET", "/users/@me/relationships")
+	if err != nil {
+		return nil, fmt.Errorf("fetching relationships: %w", err)
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("fetching relationships: HTTP %d — %s", status, string(body))
+	}
+
+	var rels []Relationship
+	if err := json.Unmarshal(body, &rels); err != nil {
+		return nil, fmt.Errorf("parsing relationships: %w", err)
+	}
+
+	return rels, nil
+}
+
+func (c *DiscordClient) OpenDMChannel(recipientID string) (*Channel, error) {
+	jsonBody := fmt.Sprintf(`{"recipient_id":"%s"}`, recipientID)
+	body, status, err := c.requestWithBody("POST", "/users/@me/channels", jsonBody)
+	if err != nil {
+		return nil, fmt.Errorf("opening DM channel: %w", err)
+	}
+
+	if status != 200 {
+		return nil, fmt.Errorf("opening DM channel: HTTP %d — %s", status, string(body))
+	}
+
+	var ch Channel
+	if err := json.Unmarshal(body, &ch); err != nil {
+		return nil, fmt.Errorf("parsing DM channel: %w", err)
+	}
+
+	return &ch, nil
+}
+
+// =============================================================================
+// Discord API methods — Guild channel & thread discovery
+// =============================================================================
+
+// GetGuildChannels fetches all channels in a guild.
+func (c *DiscordClient) GetGuildChannels(guildID string) ([]Channel, error) {
+	body, status, err := c.request("GET", fmt.Sprintf("/guilds/%s/channels", guildID))
+	if err != nil {
+		return nil, fmt.Errorf("fetching guild channels: %w", err)
+	}
+	if status == 403 {
+		return nil, nil // No access
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("fetching guild channels: HTTP %d", status)
+	}
+
+	var channels []Channel
+	if err := json.Unmarshal(body, &channels); err != nil {
+		return nil, fmt.Errorf("parsing guild channels: %w", err)
+	}
+
+	return channels, nil
+}
+
+// GetActiveGuildThreads fetches all active threads in a guild.
+func (c *DiscordClient) GetActiveGuildThreads(guildID string) ([]Channel, error) {
+	body, status, err := c.request("GET", fmt.Sprintf("/guilds/%s/threads/active", guildID))
+	if err != nil {
+		return nil, fmt.Errorf("fetching active threads: %w", err)
+	}
+	if status == 403 {
+		return nil, nil
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("fetching active threads: HTTP %d", status)
+	}
+
+	var result ThreadListResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parsing active threads: %w", err)
+	}
+
+	return result.Threads, nil
+}
+
+// GetArchivedPublicThreads fetches all archived public threads for a channel.
+func (c *DiscordClient) GetArchivedPublicThreads(channelID string) ([]Channel, error) {
+	return c.getArchivedThreads(channelID, "public")
+}
+
+// GetArchivedPrivateThreads fetches all archived private threads for a channel.
+func (c *DiscordClient) GetArchivedPrivateThreads(channelID string) ([]Channel, error) {
+	return c.getArchivedThreads(channelID, "private")
+}
+
+func (c *DiscordClient) getArchivedThreads(channelID, kind string) ([]Channel, error) {
+	var allThreads []Channel
+	before := ""
+
+	for {
+		path := fmt.Sprintf("/channels/%s/threads/archived/%s?limit=100", channelID, kind)
+		if before != "" {
+			path += "&before=" + before
+		}
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			return allThreads, fmt.Errorf("fetching archived %s threads: %w", kind, err)
+		}
+		if status == 403 || status == 400 {
+			break // No access or not applicable
+		}
+		if status != 200 {
+			return allThreads, fmt.Errorf("fetching archived %s threads: HTTP %d", kind, status)
+		}
+
+		var result ThreadListResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return allThreads, fmt.Errorf("parsing archived threads: %w", err)
+		}
+
+		allThreads = append(allThreads, result.Threads...)
+
+		if !result.HasMore || len(result.Threads) == 0 {
+			break
+		}
+
+		// Paginate using the last thread's archive_timestamp
+		lastThread := result.Threads[len(result.Threads)-1]
+		if lastThread.ThreadMetadata != nil {
+			before = lastThread.ThreadMetadata.ArchiveTimestamp
+		} else {
+			break
+		}
+
+		time.Sleep(batchDelay)
+	}
+
+	return allThreads, nil
+}
+
+// discoverAllGuildChannelsAndThreads returns all text-capable channels and
+// threads in a guild. This is needed for reaction removal (unlike message
+// deletion which uses the search API, there's no search-by-reactor endpoint).
+func (c *DiscordClient) discoverAllGuildChannelsAndThreads(guildID string) []string {
+	seen := make(map[string]bool)
+	var channelIDs []string
+
+	addChannel := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			channelIDs = append(channelIDs, id)
+		}
+	}
+
+	// Get all guild channels
+	channels, err := c.GetGuildChannels(guildID)
+	if err != nil {
+		return channelIDs
+	}
+
+	// Filter to text-capable channel types and collect parent channels
+	var parentChannelIDs []string
+	for _, ch := range channels {
+		switch ch.Type {
+		case ChannelTypeGuildText, ChannelTypeGuildNews:
+			addChannel(ch.ID)
+			parentChannelIDs = append(parentChannelIDs, ch.ID)
+		case ChannelTypeGuildVoice, ChannelTypeGuildStageVoice:
+			addChannel(ch.ID)
+		case ChannelTypeGuildForum, ChannelTypeGuildMedia:
+			// Forum/media channels don't have messages directly,
+			// but their threads (posts) do. We'll discover threads below.
+			parentChannelIDs = append(parentChannelIDs, ch.ID)
+		}
+	}
+
+	// Get all active threads in the guild
+	activeThreads, err := c.GetActiveGuildThreads(guildID)
+	if err == nil {
+		for _, t := range activeThreads {
+			addChannel(t.ID)
+		}
+	}
+
+	// Get archived public + private threads for each parent channel
+	for _, parentID := range parentChannelIDs {
+		pubThreads, err := c.GetArchivedPublicThreads(parentID)
+		if err == nil {
+			for _, t := range pubThreads {
+				addChannel(t.ID)
+			}
+		}
+
+		privThreads, err := c.GetArchivedPrivateThreads(parentID)
+		if err == nil {
+			for _, t := range privThreads {
+				addChannel(t.ID)
+			}
+		}
+
+		time.Sleep(500 * time.Millisecond) // small delay between parent channels
+	}
+
+	return channelIDs
+}
+
+// =============================================================================
+// Discord Data Package
+// =============================================================================
+
+func LoadDataPackageChannelIDs(packagePath string) ([]string, error) {
+	indexPath := packagePath
+
+	info, err := os.Stat(packagePath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access path %s: %w", packagePath, err)
+	}
+
+	if info.IsDir() {
+		candidate := filepath.Join(packagePath, "messages", "index.json")
+		if _, err := os.Stat(candidate); err == nil {
+			indexPath = candidate
+		} else {
+			return nil, fmt.Errorf("could not find messages/index.json in %s", packagePath)
+		}
+	}
+
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading index file: %w", err)
+	}
+
+	var index map[string]interface{}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("parsing index.json: %w", err)
+	}
+
+	var channelIDs []string
+	for id := range index {
+		channelIDs = append(channelIDs, id)
+	}
+
+	return channelIDs, nil
+}
+
+// =============================================================================
+// Search and delete methods
+// =============================================================================
+
+// SearchGuildMessages uses Discord's search API to find all messages by the
+// user in a guild. Covers all text channels, threads, forums, announcements,
+// and voice text chat.
+func (c *DiscordClient) SearchGuildMessages(guildID string) (int, error) {
+	totalDeleted := 0
+	staleCount := 0
+
+	for {
+		path := fmt.Sprintf("/guilds/%s/messages/search?author_id=%s&include_nsfw=true&sort_by=timestamp&sort_order=desc", guildID, c.userID)
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("search request: %w", err)
+		}
+
+		if status == 202 {
+			fmt.Printf("   ⏳ Search index building, waiting...\n")
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		if status == 403 {
+			fmt.Printf("   ⚠️  No permission to search this server, skipping.\n")
+			return totalDeleted, nil
+		}
+
+		if status != 200 {
+			return totalDeleted, fmt.Errorf("search returned HTTP %d: %s", status, string(body))
+		}
+
+		var result SearchResult
+		if err := json.Unmarshal(body, &result); err != nil {
+			return totalDeleted, fmt.Errorf("parsing search results: %w", err)
+		}
+
+		if result.TotalResults == 0 || len(result.Messages) == 0 {
+			break
+		}
+
+		fmt.Printf("   📊 %d messages remaining...\n", result.TotalResults)
+
+		deletedThisRound := 0
+
+		for _, msgGroup := range result.Messages {
+			for _, msg := range msgGroup {
+				if msg.Author.ID == c.userID && msg.Hit {
+					_, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", msg.ChannelID, msg.ID))
+					if err != nil {
+						fmt.Printf("   ⚠️  Failed to delete message %s: %v\n", msg.ID, err)
+					} else if delStatus == 204 || delStatus == 200 {
+						totalDeleted++
+						deletedThisRound++
+					} else if delStatus == 404 {
+						deletedThisRound++
+					} else if delStatus == 403 {
+						fmt.Printf("   ⚠️  Cannot delete message %s (no permission)\n", msg.ID)
+					} else {
+						fmt.Printf("   ⚠️  Unexpected status %d deleting message %s\n", delStatus, msg.ID)
+					}
+
+					time.Sleep(deleteDelay)
+				}
+			}
+		}
+
+		if deletedThisRound == 0 {
+			staleCount++
+			if staleCount >= 3 {
+				fmt.Printf("   ⚠️  Unable to delete remaining messages (may lack permissions). Moving on.\n")
+				break
+			}
+		} else {
+			staleCount = 0
+		}
+
+		time.Sleep(searchDelay)
+	}
+
+	return totalDeleted, nil
+}
+
+// SearchDMMessages uses Discord's search API to find and delete all messages
+// in a DM or group DM channel.
+func (c *DiscordClient) SearchDMMessages(channelID string) (int, error) {
+	totalDeleted := 0
+	staleCount := 0
+
+	for {
+		path := fmt.Sprintf("/channels/%s/messages/search?author_id=%s", channelID, c.userID)
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("search request: %w", err)
+		}
+
+		if status == 202 {
+			fmt.Printf("   ⏳ Search index building, waiting...\n")
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		if status == 403 || status == 400 {
+			fallbackCount, _ := c.iterateAndDeleteChannel(channelID)
+			return totalDeleted + fallbackCount, nil
+		}
+
+		if status != 200 {
+			fallbackCount, _ := c.iterateAndDeleteChannel(channelID)
+			return totalDeleted + fallbackCount, nil
+		}
+
+		var result SearchResult
+		if err := json.Unmarshal(body, &result); err != nil {
+			return totalDeleted, fmt.Errorf("parsing search results: %w", err)
+		}
+
+		if result.TotalResults == 0 || len(result.Messages) == 0 {
+			break
+		}
+
+		fmt.Printf("   📊 %d messages remaining...\n", result.TotalResults)
+
+		deletedThisRound := 0
+
+		for _, msgGroup := range result.Messages {
+			for _, msg := range msgGroup {
+				if msg.Author.ID == c.userID && msg.Hit {
+					_, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", channelID, msg.ID))
+					if err != nil {
+						fmt.Printf("   ⚠️  Failed to delete message %s: %v\n", msg.ID, err)
+					} else if delStatus == 204 || delStatus == 200 {
+						totalDeleted++
+						deletedThisRound++
+					} else if delStatus == 404 {
+						deletedThisRound++
+					} else {
+						fmt.Printf("   ⚠️  Unexpected status %d deleting message %s\n", delStatus, msg.ID)
+					}
+
+					time.Sleep(deleteDelay)
+				}
+			}
+		}
+
+		if deletedThisRound == 0 {
+			staleCount++
+			if staleCount >= 3 {
+				fmt.Printf("   ⚠️  Unable to delete remaining messages. Moving on.\n")
+				break
+			}
+		} else {
+			staleCount = 0
+		}
+
+		time.Sleep(searchDelay)
+	}
+
+	return totalDeleted, nil
+}
+
+// iterateAndDeleteChannel pages through all messages in a channel and deletes
+// the ones authored by the user. Fallback when search API is unavailable.
+func (c *DiscordClient) iterateAndDeleteChannel(channelID string) (int, error) {
+	totalDeleted := 0
+	beforeID := ""
+
+	for {
+		path := fmt.Sprintf("/channels/%s/messages?limit=100", channelID)
+		if beforeID != "" {
+			path += "&before=" + beforeID
+		}
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("fetching messages: %w", err)
+		}
+
+		if status == 403 {
+			break
+		}
+
+		if status != 200 {
+			return totalDeleted, fmt.Errorf("fetching messages: HTTP %d", status)
+		}
+
+		var messages []Message
+		if err := json.Unmarshal(body, &messages); err != nil {
+			return totalDeleted, fmt.Errorf("parsing messages: %w", err)
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, msg := range messages {
+			if msg.Author.ID == c.userID {
+				_, delStatus, err := c.request("DELETE", fmt.Sprintf("/channels/%s/messages/%s", channelID, msg.ID))
+				if err == nil && (delStatus == 204 || delStatus == 200 || delStatus == 404) {
+					totalDeleted++
+				}
+				time.Sleep(deleteDelay)
+			}
+		}
+
+		beforeID = messages[len(messages)-1].ID
+
+		if len(messages) < 100 {
+			break
+		}
+
+		time.Sleep(batchDelay)
+	}
+
+	return totalDeleted, nil
+}
+
+// =============================================================================
+// Reaction removal methods
+// =============================================================================
+
+// formatEmojiForURL returns the URL-safe string for an emoji to use in API paths.
+// Unicode emoji: URL-encoded character (e.g. %F0%9F%91%8D for 👍)
+// Custom emoji: name:id (ASCII-safe, no encoding needed)
+func formatEmojiForURL(emoji EmojiInfo) string {
+	if emoji.ID != nil && *emoji.ID != "" {
+		// Custom emoji — name is always alphanumeric/underscore, ID is numeric
+		return emoji.Name + ":" + *emoji.ID
+	}
+	// Unicode emoji — must be URL-encoded
+	return url.PathEscape(emoji.Name)
+}
+
+// removeReaction removes the current user's reaction from a message.
+func (c *DiscordClient) removeReaction(channelID, messageID string, emoji EmojiInfo) error {
+	emojiPath := formatEmojiForURL(emoji)
+	path := fmt.Sprintf("/channels/%s/messages/%s/reactions/%s/@me", channelID, messageID, emojiPath)
+
+	_, status, err := c.request("DELETE", path)
+	if err != nil {
+		return err
+	}
+	if status == 204 || status == 200 || status == 404 {
+		return nil // success or already removed
+	}
+	return fmt.Errorf("HTTP %d", status)
+}
+
+// removeReactionsFromChannel iterates through ALL messages in a channel and
+// removes any reactions placed by the current user. Returns the number of
+// reactions removed.
+//
+// This must iterate all messages (not just the user's) because reactions can be
+// on anyone's messages. There is no Discord API to search by reactor.
+func (c *DiscordClient) removeReactionsFromChannel(channelID string) int {
+	totalRemoved := 0
+	beforeID := ""
+
+	for {
+		path := fmt.Sprintf("/channels/%s/messages?limit=100", channelID)
+		if beforeID != "" {
+			path += "&before=" + beforeID
+		}
+
+		body, status, err := c.request("GET", path)
+		if err != nil {
+			break
+		}
+
+		if status == 403 || status == 404 {
+			break // No access or channel gone
+		}
+
+		if status != 200 {
+			break
+		}
+
+		var messages []Message
+		if err := json.Unmarshal(body, &messages); err != nil {
+			break
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, msg := range messages {
+			// Check each reaction on this message
+			for _, reaction := range msg.Reactions {
+				if reaction.Me {
+					err := c.removeReaction(channelID, msg.ID, reaction.Emoji)
+					if err == nil {
+						totalRemoved++
+					}
+					time.Sleep(reactionDelay)
+				}
+			}
+		}
+
+		beforeID = messages[len(messages)-1].ID
+
+		if len(messages) < 100 {
+			break
+		}
+
+		time.Sleep(batchDelay)
+	}
+
+	return totalRemoved
+}
+
+// =============================================================================
+// Main purge orchestration
+// =============================================================================
+
+func (c *DiscordClient) PurgeAll(dataPackagePath string) {
+	totalDeleted := 0
+	totalReactionsRemoved := 0
+	startTime := time.Now()
+
+	// Track processed DM channel IDs to avoid duplicate work
+	processedDMs := make(map[string]bool)
+
+	// =========================================================================
+	// Phase 1: Server messages via search API
+	// =========================================================================
+	fmt.Println("📡 Phase 1: Deleting messages from ALL servers...")
+	fmt.Println()
+
+	guilds, err := c.GetAllGuilds()
+	if err != nil {
+		fmt.Printf("❌ Error fetching servers: %v\n", err)
+	} else {
+		fmt.Printf("✅ Found %d servers.\n\n", len(guilds))
+
+		for i, guild := range guilds {
+			name := guild.Name
+			if name == "" {
+				name = guild.ID
+			}
+			fmt.Printf("[%d/%d] 🔍 Searching server: %s\n", i+1, len(guilds), name)
+
+			count, err := c.SearchGuildMessages(guild.ID)
+			if err != nil {
+				fmt.Printf("   ❌ Error: %v\n", err)
+			}
+			if count > 0 {
+				fmt.Printf("   ✅ Deleted %d messages\n", count)
+			} else {
+				fmt.Printf("   ✓ No messages found\n")
+			}
+			totalDeleted += count
+			fmt.Println()
+		}
+	}
+
+	// =========================================================================
+	// Phase 2a: Visible/open DM channels
+	// =========================================================================
+	fmt.Println("💬 Phase 2a: Deleting messages from open/visible DM channels...")
+	fmt.Println()
+
+	channels, err := c.GetDMChannels()
+	if err != nil {
+		fmt.Printf("❌ Error fetching DM channels: %v\n", err)
+	} else {
+		fmt.Printf("✅ Found %d open DM channels.\n\n", len(channels))
+
+		for i, ch := range channels {
+			processedDMs[ch.ID] = true
+			label := describeChannel(ch)
+			fmt.Printf("[%d/%d] 🔍 Processing DM: %s\n", i+1, len(channels), label)
+
+			count, err := c.SearchDMMessages(ch.ID)
+			if err != nil {
+				fmt.Printf("   ❌ Error: %v\n", err)
+			}
+			if count > 0 {
+				fmt.Printf("   ✅ Deleted %d messages\n", count)
+			} else {
+				fmt.Printf("   ✓ No messages found\n")
+			}
+			totalDeleted += count
+			fmt.Println()
+		}
+	}
+
+	// =========================================================================
+	// Phase 2b: Hidden DMs via relationships
+	// =========================================================================
+	fmt.Println("🔗 Phase 2b: Discovering hidden/closed DMs via relationships...")
+	fmt.Println("   (Re-opening DMs with friends, blocked users, and pending requests)")
+	fmt.Println()
+
+	rels, err := c.GetRelationships()
+	if err != nil {
+		fmt.Printf("❌ Error fetching relationships: %v\n", err)
+	} else {
+		fmt.Printf("✅ Found %d relationships.\n", len(rels))
+
+		discoveredCount := 0
+		for _, rel := range rels {
+			ch, err := c.OpenDMChannel(rel.User.ID)
+			if err != nil {
+				continue
+			}
+
+			if processedDMs[ch.ID] {
+				continue
+			}
+
+			discoveredCount++
+			processedDMs[ch.ID] = true
+
+			relType := "related"
+			switch rel.Type {
+			case RelationshipFriend:
+				relType = "friend"
+			case RelationshipBlocked:
+				relType = "blocked"
+			case RelationshipIncomingReq:
+				relType = "incoming request"
+			case RelationshipOutgoingReq:
+				relType = "outgoing request"
+			}
+
+			fmt.Printf("   🔓 Found hidden DM with %s (%s)\n", rel.User.Username, relType)
+
+			count, err := c.SearchDMMessages(ch.ID)
+			if err != nil {
+				fmt.Printf("      ❌ Error: %v\n", err)
+			}
+			if count > 0 {
+				fmt.Printf("      ✅ Deleted %d messages\n", count)
+			}
+			totalDeleted += count
+
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		if discoveredCount == 0 {
+			fmt.Println("   ✓ No additional hidden DMs found (all already processed)")
+		}
+		fmt.Println()
+	}
+
+	// =========================================================================
+	// Phase 2c: DMs from Discord data package (optional)
+	// =========================================================================
+	if dataPackagePath != "" {
+		fmt.Println("📦 Phase 2c: Processing DMs from Discord data package...")
+		fmt.Printf("   Loading: %s\n", dataPackagePath)
+
+		packageChannelIDs, err := LoadDataPackageChannelIDs(dataPackagePath)
+		if err != nil {
+			fmt.Printf("❌ Error loading data package: %v\n", err)
+		} else {
+			fmt.Printf("✅ Found %d channels in data package.\n", len(packageChannelIDs))
+
+			newChannels := 0
+			for _, chID := range packageChannelIDs {
+				if processedDMs[chID] {
+					continue
+				}
+				processedDMs[chID] = true
+				newChannels++
+
+				fmt.Printf("   🔍 Processing data package channel: %s\n", chID)
+
+				count, err := c.SearchDMMessages(chID)
+				if err != nil {
+					count, _ = c.iterateAndDeleteChannel(chID)
+				}
+				if count > 0 {
+					fmt.Printf("      ✅ Deleted %d messages\n", count)
+				}
+				totalDeleted += count
+			}
+
+			if newChannels == 0 {
+				fmt.Println("   ✓ No additional channels found beyond what was already processed")
+			}
+			fmt.Println()
+		}
+	} else {
+		fmt.Println("📦 Phase 2c: Discord data package (skipped — not provided)")
+		fmt.Println("   For the most complete DM coverage, provide your Discord data export:")
+		fmt.Println("   discord-purge --data-package /path/to/package")
+		fmt.Println()
+	}
+
+	// =========================================================================
+	// Phase 3: Remove all reactions from server channels
+	// =========================================================================
+	fmt.Println("👎 Phase 3: Removing reactions you placed on other people's messages...")
+	fmt.Println("   (This requires scanning all messages in all channels — may take a while)")
+	fmt.Println()
+
+	// Phase 3a: Server reactions
+	for i, guild := range guilds {
+		name := guild.Name
+		if name == "" {
+			name = guild.ID
+		}
+		fmt.Printf("[%d/%d] 🔍 Scanning server for reactions: %s\n", i+1, len(guilds), name)
+
+		// Discover all text channels + threads in this guild
+		channelIDs := c.discoverAllGuildChannelsAndThreads(guild.ID)
+		fmt.Printf("   📂 Found %d channels/threads to scan\n", len(channelIDs))
+
+		guildReactions := 0
+		for j, chID := range channelIDs {
+			removed := c.removeReactionsFromChannel(chID)
+			guildReactions += removed
+			if removed > 0 {
+				fmt.Printf("   ✅ Removed %d reactions from channel %d/%d\n", removed, j+1, len(channelIDs))
+			}
+		}
+
+		totalReactionsRemoved += guildReactions
+		if guildReactions > 0 {
+			fmt.Printf("   ✅ Total: removed %d reactions from this server\n", guildReactions)
+		} else {
+			fmt.Printf("   ✓ No reactions found\n")
+		}
+		fmt.Println()
+	}
+
+	// Phase 3b: DM reactions
+	fmt.Println("   💬 Scanning DM channels for reactions...")
+	dmReactionCount := 0
+	for chID := range processedDMs {
+		removed := c.removeReactionsFromChannel(chID)
+		dmReactionCount += removed
+		if removed > 0 {
+			fmt.Printf("   ✅ Removed %d reactions from DM %s\n", removed, chID)
+		}
+	}
+	totalReactionsRemoved += dmReactionCount
+
+	if dmReactionCount == 0 {
+		fmt.Println("   ✓ No DM reactions found")
+	}
+	fmt.Println()
+
+	// =========================================================================
+	// Summary
+	// =========================================================================
+	elapsed := time.Since(startTime).Round(time.Second)
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("✅ Purge complete!\n")
+	fmt.Printf("📊 Total messages deleted:       %d\n", totalDeleted)
+	fmt.Printf("👎 Total reactions removed:      %d\n", totalReactionsRemoved)
+	fmt.Printf("⏱️  Time elapsed:                 %s\n", elapsed)
+	fmt.Printf("🏠 Servers processed:            %d\n", len(guilds))
+	fmt.Printf("💬 DM channels processed:        %d\n", len(processedDMs))
+	fmt.Println(strings.Repeat("=", 60))
+}
+
+// describeChannel returns a human-readable label for a DM channel.
+func describeChannel(ch Channel) string {
+	if len(ch.Recipients) == 0 {
+		return fmt.Sprintf("Channel %s", ch.ID)
+	}
+	if len(ch.Recipients) == 1 {
+		r := ch.Recipients[0]
+		if r.Discriminator != "" && r.Discriminator != "0" {
+			return fmt.Sprintf("%s#%s", r.Username, r.Discriminator)
+		}
+		return r.Username
+	}
+	names := make([]string, 0, len(ch.Recipients))
+	for _, r := range ch.Recipients {
+		names = append(names, r.Username)
+	}
+	return fmt.Sprintf("Group: %s", strings.Join(names, ", "))
+}
+
+// =============================================================================
+// User interaction
+// =============================================================================
+
+func main() {
+	fmt.Println("╔══════════════════════════════════════════════════════╗")
+	fmt.Println("║          Discord Message Purge Tool                 ║")
+	fmt.Println("║          Deletes ALL your messages everywhere       ║")
+	fmt.Println("╚══════════════════════════════════════════════════════╝")
+	fmt.Println()
+
+	// Parse optional --data-package flag
+	dataPackagePath := ""
+	for i, arg := range os.Args[1:] {
+		if arg == "--data-package" || arg == "-d" {
+			if i+1 < len(os.Args[1:]) {
+				dataPackagePath = os.Args[i+2]
+			} else {
+				fmt.Println("❌ --data-package requires a path argument")
+				os.Exit(1)
+			}
+		}
+	}
+
+	// Check for token in environment variable first
+	token := os.Getenv("DISCORD_TOKEN")
+	if token == "" {
+		token = promptForToken()
+	} else {
+		fmt.Println("✅ Using token from DISCORD_TOKEN environment variable.")
+		fmt.Println()
+	}
+
+	// Clean up token — strip surrounding quotes (common copy-paste issue)
+	token = strings.Trim(token, "\" '\t\r\n")
+
+	if token == "" {
+		fmt.Println("❌ Error: Token is required.")
+		os.Exit(1)
+	}
+
+	// Create client and authenticate
+	client := NewDiscordClient(token)
+
+	fmt.Println("🔐 Authenticating...")
+	err := client.Authenticate()
+	if err != nil {
+		fmt.Printf("❌ Authentication failed: %v\n", err)
+		fmt.Println()
+		fmt.Println("Troubleshooting:")
+		fmt.Println("  • Make sure you copied the full token")
+		fmt.Println("  • Tokens expire — get a fresh one if it's old")
+		fmt.Println("  • Don't include quotes around the token")
+		os.Exit(1)
+	}
+
+	fmt.Printf("✅ Authenticated as: %s (ID: %s)\n", client.username, client.userID)
+	fmt.Println()
+
+	// Confirmation
+	if !confirmDeletion() {
+		fmt.Println("Operation cancelled.")
+		os.Exit(0)
+	}
+
+	fmt.Println()
+	fmt.Println("Starting message purge... This may take a very long time.")
+	fmt.Println("You can press Ctrl+C at any time to stop. Already-deleted messages stay deleted.")
+	fmt.Println()
+
+	client.PurgeAll(dataPackagePath)
+}
+
+func promptForToken() string {
+	fmt.Println("Discord no longer supports username/password login via API.")
+	fmt.Println("You need to provide your user token instead.")
+	fmt.Println()
+	fmt.Println("┌─ How to get your Discord token ─────────────────────┐")
+	fmt.Println("│                                                     │")
+	fmt.Println("│  1. Open Discord in your browser (discord.com)      │")
+	fmt.Println("│  2. Press F12 to open Developer Tools               │")
+	fmt.Println("│  3. Go to the Network tab                           │")
+	fmt.Println("│  4. Type 'api' in the filter box                    │")
+	fmt.Println("│  5. Click on any request to discord.com/api/...     │")
+	fmt.Println("│  6. In Headers, find 'authorization'                │")
+	fmt.Println("│  7. Copy the token value                            │")
+	fmt.Println("│                                                     │")
+	fmt.Println("│  Or set the DISCORD_TOKEN environment variable.     │")
+	fmt.Println("└─────────────────────────────────────────────────────┘")
+	fmt.Println()
+	fmt.Print("Enter your Discord user token: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	token, _ := reader.ReadString('\n')
+	return strings.TrimSpace(token)
+}
+
+func confirmDeletion() bool {
+	fmt.Println("╔══════════════════════════════════════════════════════╗")
+	fmt.Println("║  ⚠️  WARNING — DESTRUCTIVE ACTION                   ║")
+	fmt.Println("╠══════════════════════════════════════════════════════╣")
+	fmt.Println("║                                                     ║")
+	fmt.Println("║  This will DELETE ALL messages you have ever sent:  ║")
+	fmt.Println("║                                                     ║")
+	fmt.Println("║    • All messages in ALL servers                    ║")
+	fmt.Println("║    • All threads (public & private)                 ║")
+	fmt.Println("║    • All forum posts                                ║")
+	fmt.Println("║    • All direct messages (open AND hidden)          ║")
+	fmt.Println("║    • All group DMs                                  ║")
+	fmt.Println("║    • All reactions you placed on any message        ║")
+	fmt.Println("║                                                     ║")
+	fmt.Println("║  This action CANNOT be undone!                      ║")
+	fmt.Println("║                                                     ║")
+	fmt.Println("╚══════════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Print("Would you like to delete all public and private messages")
+	fmt.Print(" you have ever sent from this account? (yes/no): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	return response == "yes" || response == "y"
+}
