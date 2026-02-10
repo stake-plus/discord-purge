@@ -22,7 +22,7 @@ const (
 	apiBase = "https://discord.com/api/v9"
 
 	// Conservative pacing to reduce transient 400/429 churn.
-	searchDelay          = 30 * time.Second
+	searchDelay          = 60 * time.Second
 	deleteDelay          = 1500 * time.Millisecond
 	reactionDelay        = 600 * time.Millisecond
 	batchDelay           = 1500 * time.Millisecond
@@ -192,13 +192,31 @@ func (c *DiscordClient) requestWithBody(method, path, jsonBody string) ([]byte, 
 				}
 			}
 
-			var rl RateLimitResponse
-			if json.Unmarshal(body, &rl) == nil && rl.RetryAfter > 0 {
-				waitTime = rl.RetryAfter
+			if resetAfter := resp.Header.Get("X-RateLimit-Reset-After"); resetAfter != "" {
+				if parsed, err := strconv.ParseFloat(resetAfter, 64); err == nil && parsed > waitTime {
+					waitTime = parsed
+				}
 			}
 
-			waitTime += 0.5
-			fmt.Printf("   ⏳ Rate limited, waiting %.1f seconds (attempt %d/5)...\n", waitTime, attempt+1)
+			var rl RateLimitResponse
+			if json.Unmarshal(body, &rl) == nil && rl.RetryAfter > 0 {
+				if rl.RetryAfter > waitTime {
+					waitTime = rl.RetryAfter
+				}
+			}
+
+			// Add a safety buffer and floor to avoid tight 429 loops (e.g., 0.8s).
+			waitTime += 1.0
+			if waitTime < 2.0 {
+				waitTime = 2.0
+			}
+
+			scope := ""
+			if rl.Global {
+				scope = " (global)"
+			}
+
+			fmt.Printf("   ⏳ Rate limited%s on %s %s, waiting %.1f seconds (attempt %d/5)...\n", scope, method, path, waitTime, attempt+1)
 			time.Sleep(time.Duration(waitTime*1000) * time.Millisecond)
 			continue
 		}
