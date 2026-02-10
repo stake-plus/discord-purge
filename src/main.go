@@ -845,13 +845,35 @@ func (c *DiscordClient) removeReactionsFromChannel(channelID string) int {
 // Main purge orchestration
 // =============================================================================
 
-func (c *DiscordClient) PurgeAll(dataPackagePath string) {
+// PurgeStats holds detailed statistics about the purge operation
+type PurgeStats struct {
+	TotalMessagesDeleted   int
+	TotalReactionsRemoved  int
+	TotalDMMessagesDeleted int
+	ServerStats            []ServerStat
+	DMChannelsProcessed    int
+	TimeElapsed            time.Duration
+}
+
+// ServerStat holds per-server statistics
+type ServerStat struct {
+	GuildID   string
+	GuildName string
+	Messages  int
+	Reactions int
+}
+
+func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 	totalDeleted := 0
 	totalReactionsRemoved := 0
+	totalDMMessages := 0
 	startTime := time.Now()
 
 	// Track processed DM channel IDs to avoid duplicate work
 	processedDMs := make(map[string]bool)
+
+	// Track per-server stats
+	var serverStats []ServerStat
 
 	// =========================================================================
 	// Phase 1: Server messages via search API
@@ -862,6 +884,7 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 	guilds, err := c.GetAllGuilds()
 	if err != nil {
 		fmt.Printf("❌ Error fetching servers: %v\n", err)
+		guilds = []Guild{} // Initialize empty slice to avoid nil
 	} else {
 		fmt.Printf("✅ Found %d servers.\n\n", len(guilds))
 
@@ -882,6 +905,14 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 				fmt.Printf("   ✓ No messages found\n")
 			}
 			totalDeleted += count
+
+			// Initialize server stat (reactions will be added in Phase 3)
+			serverStats = append(serverStats, ServerStat{
+				GuildID:   guild.ID,
+				GuildName: name,
+				Messages:  count,
+				Reactions: 0,
+			})
 			fmt.Println()
 		}
 	}
@@ -912,6 +943,7 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 			} else {
 				fmt.Printf("   ✓ No messages found\n")
 			}
+			totalDMMessages += count
 			totalDeleted += count
 			fmt.Println()
 		}
@@ -965,6 +997,7 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 			if count > 0 {
 				fmt.Printf("      ✅ Deleted %d messages\n", count)
 			}
+			totalDMMessages += count
 			totalDeleted += count
 
 			time.Sleep(500 * time.Millisecond)
@@ -1006,6 +1039,7 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 				if count > 0 {
 					fmt.Printf("      ✅ Deleted %d messages\n", count)
 				}
+				totalDMMessages += count
 				totalDeleted += count
 			}
 
@@ -1049,6 +1083,14 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 			}
 		}
 
+		// Update server stats with reaction count
+		for i := range serverStats {
+			if serverStats[i].GuildID == guild.ID {
+				serverStats[i].Reactions = guildReactions
+				break
+			}
+		}
+
 		totalReactionsRemoved += guildReactions
 		if guildReactions > 0 {
 			fmt.Printf("   ✅ Total: removed %d reactions from this server\n", guildReactions)
@@ -1079,14 +1121,120 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) {
 	// Summary
 	// =========================================================================
 	elapsed := time.Since(startTime).Round(time.Second)
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("✅ Purge complete!\n")
-	fmt.Printf("📊 Total messages deleted:       %d\n", totalDeleted)
-	fmt.Printf("👎 Total reactions removed:      %d\n", totalReactionsRemoved)
-	fmt.Printf("⏱️  Time elapsed:                 %s\n", elapsed)
-	fmt.Printf("🏠 Servers processed:            %d\n", len(guilds))
-	fmt.Printf("💬 DM channels processed:        %d\n", len(processedDMs))
-	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println(strings.Repeat("=", 70))
+	fmt.Println("✅ PURGE COMPLETE!")
+	fmt.Println(strings.Repeat("=", 70))
+	fmt.Println()
+	fmt.Printf("📊 TOTAL MESSAGES DELETED:        %d\n", totalDeleted)
+	fmt.Printf("👎 TOTAL REACTIONS REMOVED:       %d\n", totalReactionsRemoved)
+	fmt.Printf("💬 TOTAL DM MESSAGES DELETED:     %d\n", totalDMMessages)
+	fmt.Println()
+	fmt.Println("📈 PER-SERVER BREAKDOWN:")
+	fmt.Println(strings.Repeat("-", 70))
+
+	if len(serverStats) == 0 {
+		fmt.Println("   No servers processed.")
+	} else {
+		for _, stat := range serverStats {
+			fmt.Printf("   🏠 %s\n", stat.GuildName)
+			fmt.Printf("      Messages deleted:  %d\n", stat.Messages)
+			fmt.Printf("      Reactions removed: %d\n", stat.Reactions)
+			fmt.Println()
+		}
+	}
+
+	fmt.Println(strings.Repeat("-", 70))
+	fmt.Printf("⏱️  Time elapsed:                  %s\n", elapsed)
+	fmt.Printf("🏠 Servers processed:             %d\n", len(guilds))
+	fmt.Printf("💬 DM channels processed:         %d\n", len(processedDMs))
+	fmt.Println(strings.Repeat("=", 70))
+
+	return PurgeStats{
+		TotalMessagesDeleted:   totalDeleted,
+		TotalReactionsRemoved:  totalReactionsRemoved,
+		TotalDMMessagesDeleted: totalDMMessages,
+		ServerStats:            serverStats,
+		DMChannelsProcessed:    len(processedDMs),
+		TimeElapsed:            elapsed,
+	}
+}
+
+// =============================================================================
+// Friend removal and server leaving
+// =============================================================================
+
+// RemoveFriend removes a friend relationship.
+func (c *DiscordClient) RemoveFriend(userID string) error {
+	_, status, err := c.request("DELETE", fmt.Sprintf("/users/@me/relationships/%s", userID))
+	if err != nil {
+		return err
+	}
+	if status == 204 || status == 200 {
+		return nil
+	}
+	return fmt.Errorf("HTTP %d", status)
+}
+
+// LeaveGuild leaves a server (guild).
+func (c *DiscordClient) LeaveGuild(guildID string) error {
+	_, status, err := c.request("DELETE", fmt.Sprintf("/users/@me/guilds/%s", guildID))
+	if err != nil {
+		return err
+	}
+	if status == 204 || status == 200 {
+		return nil
+	}
+	return fmt.Errorf("HTTP %d", status)
+}
+
+// RemoveAllFriends removes all friends from the user's friend list.
+func (c *DiscordClient) RemoveAllFriends() (int, error) {
+	rels, err := c.GetRelationships()
+	if err != nil {
+		return 0, fmt.Errorf("fetching relationships: %w", err)
+	}
+
+	removedCount := 0
+	for _, rel := range rels {
+		if rel.Type == RelationshipFriend {
+			err := c.RemoveFriend(rel.User.ID)
+			if err != nil {
+				fmt.Printf("   ⚠️  Failed to remove friend %s: %v\n", rel.User.Username, err)
+			} else {
+				removedCount++
+				fmt.Printf("   ✅ Removed friend: %s\n", rel.User.Username)
+			}
+			time.Sleep(500 * time.Millisecond) // Rate limit protection
+		}
+	}
+
+	return removedCount, nil
+}
+
+// LeaveAllGuilds leaves all servers the user is a member of.
+func (c *DiscordClient) LeaveAllGuilds() (int, error) {
+	guilds, err := c.GetAllGuilds()
+	if err != nil {
+		return 0, fmt.Errorf("fetching guilds: %w", err)
+	}
+
+	leftCount := 0
+	for _, guild := range guilds {
+		name := guild.Name
+		if name == "" {
+			name = guild.ID
+		}
+		err := c.LeaveGuild(guild.ID)
+		if err != nil {
+			fmt.Printf("   ⚠️  Failed to leave server %s: %v\n", name, err)
+		} else {
+			leftCount++
+			fmt.Printf("   ✅ Left server: %s\n", name)
+		}
+		time.Sleep(500 * time.Millisecond) // Rate limit protection
+	}
+
+	return leftCount, nil
 }
 
 // describeChannel returns a human-readable label for a DM channel.
@@ -1178,7 +1326,50 @@ func main() {
 	fmt.Println("You can press Ctrl+C at any time to stop. Already-deleted messages stay deleted.")
 	fmt.Println()
 
-	client.PurgeAll(dataPackagePath)
+	stats := client.PurgeAll(dataPackagePath)
+
+	// Ask if user wants to remove friends and leave servers
+	fmt.Println()
+	if confirmCleanup() {
+		fmt.Println()
+		fmt.Println("🗑️  Removing all friends and leaving all servers...")
+		fmt.Println()
+
+		// Remove friends
+		fmt.Println("👥 Removing friends...")
+		friendsRemoved, err := client.RemoveAllFriends()
+		if err != nil {
+			fmt.Printf("❌ Error removing friends: %v\n", err)
+		} else {
+			fmt.Printf("✅ Removed %d friends.\n", friendsRemoved)
+		}
+		fmt.Println()
+
+		// Leave servers
+		fmt.Println("🚪 Leaving servers...")
+		serversLeft, err := client.LeaveAllGuilds()
+		if err != nil {
+			fmt.Printf("❌ Error leaving servers: %v\n", err)
+		} else {
+			fmt.Printf("✅ Left %d servers.\n", serversLeft)
+		}
+		fmt.Println()
+
+		fmt.Println(strings.Repeat("=", 70))
+		fmt.Println("✅ CLEANUP COMPLETE!")
+		fmt.Println(strings.Repeat("=", 70))
+		fmt.Println()
+		fmt.Printf("📊 Summary:\n")
+		fmt.Printf("   • Messages deleted:        %d\n", stats.TotalMessagesDeleted)
+		fmt.Printf("   • Reactions removed:       %d\n", stats.TotalReactionsRemoved)
+		fmt.Printf("   • DM messages deleted:     %d\n", stats.TotalDMMessagesDeleted)
+		fmt.Printf("   • Friends removed:        %d\n", friendsRemoved)
+		fmt.Printf("   • Servers left:           %d\n", serversLeft)
+		fmt.Println(strings.Repeat("=", 70))
+	} else {
+		fmt.Println()
+		fmt.Println("Cleanup skipped. Friends and servers remain unchanged.")
+	}
 }
 
 func promptForToken() string {
@@ -1225,6 +1416,29 @@ func confirmDeletion() bool {
 	fmt.Println()
 	fmt.Print("Would you like to delete all public and private messages")
 	fmt.Print(" you have ever sent from this account? (yes/no): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	return response == "yes" || response == "y"
+}
+
+func confirmCleanup() bool {
+	fmt.Println("╔══════════════════════════════════════════════════════╗")
+	fmt.Println("║  ⚠️  ADDITIONAL CLEANUP OPTION                      ║")
+	fmt.Println("╠══════════════════════════════════════════════════════╣")
+	fmt.Println("║                                                     ║")
+	fmt.Println("║  Would you like to also:                            ║")
+	fmt.Println("║                                                     ║")
+	fmt.Println("║    • Remove ALL friends from your friend list      ║")
+	fmt.Println("║    • Leave ALL servers you are a member of         ║")
+	fmt.Println("║                                                     ║")
+	fmt.Println("║  This action CANNOT be undone!                      ║")
+	fmt.Println("║                                                     ║")
+	fmt.Println("╚══════════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Print("Remove all friends and leave all servers? (yes/no): ")
 
 	reader := bufio.NewReader(os.Stdin)
 	response, _ := reader.ReadString('\n')
