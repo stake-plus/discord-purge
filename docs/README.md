@@ -284,7 +284,8 @@ The tool includes built-in rate limit handling:
 |--------|-------|
 | Between message deletions | 15 seconds |
 | Between reaction removals | 600ms |
-| Between search API calls | 90 seconds |
+| Between search API calls | 3 seconds |
+| Between thread archive discovery calls | 3 seconds |
 | Between pagination batches | 1.5 seconds |
 | Rate limit retry | Automatic with `Retry-After` parsing, up to 5 retries |
 
