@@ -27,6 +27,7 @@ const (
 	reactionDelay        = 600 * time.Millisecond
 	batchDelay           = 1500 * time.Millisecond
 	threadDiscoveryDelay = 800 * time.Millisecond
+	threadArchiveDelay   = 3 * time.Second
 	errorBackoffDelay    = 1200 * time.Millisecond
 
 	maxSearchIndexWaits = 40
@@ -209,6 +210,11 @@ func (c *DiscordClient) requestWithBody(method, path, jsonBody string) ([]byte, 
 			waitTime += 1.0
 			if waitTime < 2.0 {
 				waitTime = 2.0
+			}
+
+			// Thread archive discovery routes are typically stricter than generic GETs.
+			if method == "GET" && strings.Contains(path, "/users/@me/threads/archived/private") && waitTime < 6.0 {
+				waitTime = 6.0
 			}
 
 			scope := ""
@@ -609,6 +615,7 @@ func (c *DiscordClient) discoverAllGuildChannelsAndThreads(guildID string) []str
 				addChannel(t.ID)
 			}
 		}
+		time.Sleep(threadArchiveDelay)
 
 		privThreads, err := c.GetArchivedPrivateThreads(parentID)
 		if err == nil {
@@ -616,6 +623,7 @@ func (c *DiscordClient) discoverAllGuildChannelsAndThreads(guildID string) []str
 				addChannel(t.ID)
 			}
 		}
+		time.Sleep(threadArchiveDelay)
 
 		joinedPrivThreads, err := c.GetJoinedArchivedPrivateThreads(parentID)
 		if err == nil {
