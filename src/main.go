@@ -22,13 +22,13 @@ const (
 	apiBase = "https://discord.com/api/v9"
 
 	// Conservative pacing to reduce transient 400/429 churn.
-	searchDelay          = 300 * time.Millisecond
-	deleteDelay          = 300 * time.Millisecond
-	reactionDelay        = 300 * time.Millisecond
-	batchDelay           = 300 * time.Millisecond
-	threadDiscoveryDelay = 300 * time.Millisecond
-	threadArchiveDelay   = 300 * time.Millisecond
-	errorBackoffDelay    = 1000 * time.Millisecond
+	searchDelay          = 350 * time.Millisecond
+	deleteDelay          = 350 * time.Millisecond
+	reactionDelay        = 350 * time.Millisecond
+	batchDelay           = 350 * time.Millisecond
+	threadDiscoveryDelay = 350 * time.Millisecond
+	threadArchiveDelay   = 350 * time.Millisecond
+	errorBackoffDelay    = 1250 * time.Millisecond
 
 	maxSearchIndexWaits = 40
 )
