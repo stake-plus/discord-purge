@@ -1159,7 +1159,21 @@ type ServerStat struct {
 	Reactions int
 }
 
-func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
+// PurgeOptions defines optional scope exclusions for the purge operation.
+type PurgeOptions struct {
+	ExcludedGuildIDs     map[string]bool
+	ExcludedDMChannelIDs map[string]bool
+}
+
+func (o PurgeOptions) isGuildExcluded(guildID string) bool {
+	return o.ExcludedGuildIDs != nil && o.ExcludedGuildIDs[guildID]
+}
+
+func (o PurgeOptions) isDMExcluded(channelID string) bool {
+	return o.ExcludedDMChannelIDs != nil && o.ExcludedDMChannelIDs[channelID]
+}
+
+func (c *DiscordClient) PurgeAll(dataPackagePath string, options PurgeOptions) PurgeStats {
 	totalDeleted := 0
 	totalReactionsRemoved := 0
 	totalDMMessages := 0
@@ -1174,7 +1188,7 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 	// =========================================================================
 	// Phase 1: Server messages via search API
 	// =========================================================================
-	fmt.Println("📡 Phase 1: Deleting messages from ALL servers...")
+	fmt.Println("📡 Phase 1: Deleting messages from servers (excluding any you skipped)...")
 	fmt.Println()
 
 	guilds, err := c.GetAllGuilds()
@@ -1182,7 +1196,26 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 		fmt.Printf("❌ Error fetching servers: %v\n", err)
 		guilds = []Guild{} // Initialize empty slice to avoid nil
 	} else {
-		fmt.Printf("✅ Found %d servers.\n\n", len(guilds))
+		totalGuildsFound := len(guilds)
+		excludedGuildCount := 0
+
+		if len(options.ExcludedGuildIDs) > 0 {
+			filtered := make([]Guild, 0, len(guilds))
+			for _, guild := range guilds {
+				if options.isGuildExcluded(guild.ID) {
+					excludedGuildCount++
+					continue
+				}
+				filtered = append(filtered, guild)
+			}
+			guilds = filtered
+		}
+
+		fmt.Printf("✅ Found %d servers.\n", totalGuildsFound)
+		if excludedGuildCount > 0 {
+			fmt.Printf("   ↪ Excluding %d servers selected by you.\n", excludedGuildCount)
+		}
+		fmt.Println()
 
 		for i, guild := range guilds {
 			name := guild.Name
@@ -1216,19 +1249,38 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 	// =========================================================================
 	// Phase 2a: Visible/open DM channels
 	// =========================================================================
-	fmt.Println("💬 Phase 2a: Deleting messages from open/visible DM channels...")
+	fmt.Println("💬 Phase 2a: Deleting messages from open/visible DM channels (excluding any you skipped)...")
 	fmt.Println()
 
 	channels, err := c.GetDMChannels()
 	if err != nil {
 		fmt.Printf("❌ Error fetching DM channels: %v\n", err)
 	} else {
-		fmt.Printf("✅ Found %d open DM channels.\n\n", len(channels))
+		totalOpenDMsFound := len(channels)
+		excludedOpenDMCount := 0
+		channelsToProcess := channels
 
-		for i, ch := range channels {
+		if len(options.ExcludedDMChannelIDs) > 0 {
+			channelsToProcess = make([]Channel, 0, len(channels))
+			for _, ch := range channels {
+				if options.isDMExcluded(ch.ID) {
+					excludedOpenDMCount++
+					continue
+				}
+				channelsToProcess = append(channelsToProcess, ch)
+			}
+		}
+
+		fmt.Printf("✅ Found %d open DM channels.\n", totalOpenDMsFound)
+		if excludedOpenDMCount > 0 {
+			fmt.Printf("   ↪ Excluding %d DM/group DM channels selected by you.\n", excludedOpenDMCount)
+		}
+		fmt.Println()
+
+		for i, ch := range channelsToProcess {
 			processedDMs[ch.ID] = true
 			label := describeChannel(ch)
-			fmt.Printf("[%d/%d] 🔍 Processing DM: %s\n", i+1, len(channels), label)
+			fmt.Printf("[%d/%d] 🔍 Processing DM: %s\n", i+1, len(channelsToProcess), label)
 
 			count, err := c.SearchDMMessages(ch.ID)
 			if err != nil {
@@ -1259,6 +1311,7 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 		fmt.Printf("✅ Found %d relationships.\n", len(rels))
 
 		discoveredCount := 0
+		excludedHiddenDMCount := 0
 		for _, rel := range rels {
 			ch, err := c.OpenDMChannel(rel.User.ID)
 			if err != nil {
@@ -1266,6 +1319,10 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 			}
 
 			if processedDMs[ch.ID] {
+				continue
+			}
+			if options.isDMExcluded(ch.ID) {
+				excludedHiddenDMCount++
 				continue
 			}
 
@@ -1302,6 +1359,9 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 		if discoveredCount == 0 {
 			fmt.Println("   ✓ No additional hidden DMs found (all already processed)")
 		}
+		if excludedHiddenDMCount > 0 {
+			fmt.Printf("   ↪ Skipped %d hidden DM channels from your exclusion list.\n", excludedHiddenDMCount)
+		}
 		fmt.Println()
 	}
 
@@ -1319,7 +1379,12 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 			fmt.Printf("✅ Found %d channels in data package.\n", len(packageChannelIDs))
 
 			newChannels := 0
+			excludedPackageChannelCount := 0
 			for _, chID := range packageChannelIDs {
+				if options.isDMExcluded(chID) {
+					excludedPackageChannelCount++
+					continue
+				}
 				if processedDMs[chID] {
 					continue
 				}
@@ -1341,6 +1406,9 @@ func (c *DiscordClient) PurgeAll(dataPackagePath string) PurgeStats {
 
 			if newChannels == 0 {
 				fmt.Println("   ✓ No additional channels found beyond what was already processed")
+			}
+			if excludedPackageChannelCount > 0 {
+				fmt.Printf("   ↪ Skipped %d data package channels from your exclusion list.\n", excludedPackageChannelCount)
 			}
 			fmt.Println()
 		}
@@ -1552,6 +1620,169 @@ func describeChannel(ch Channel) string {
 	return fmt.Sprintf("Group: %s", strings.Join(names, ", "))
 }
 
+func displayGuildName(guild Guild) string {
+	if guild.Name != "" {
+		return guild.Name
+	}
+	return guild.ID
+}
+
+func parseSelectionInput(input string, max int) (map[int]bool, error) {
+	selected := make(map[int]bool)
+	normalized := strings.TrimSpace(strings.ToLower(input))
+	if normalized == "" || normalized == "none" || normalized == "n" || normalized == "0" {
+		return selected, nil
+	}
+	if normalized == "all" || normalized == "*" {
+		for i := 1; i <= max; i++ {
+			selected[i] = true
+		}
+		return selected, nil
+	}
+
+	parts := strings.FieldsFunc(normalized, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t'
+	})
+	if len(parts) == 0 {
+		return selected, nil
+	}
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) != 2 || rangeParts[0] == "" || rangeParts[1] == "" {
+				return nil, fmt.Errorf("invalid range '%s'", part)
+			}
+			start, err := strconv.Atoi(rangeParts[0])
+			if err != nil {
+				return nil, fmt.Errorf("invalid number '%s'", rangeParts[0])
+			}
+			end, err := strconv.Atoi(rangeParts[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid number '%s'", rangeParts[1])
+			}
+			if start > end {
+				start, end = end, start
+			}
+			if start < 1 || end > max {
+				return nil, fmt.Errorf("range %d-%d is out of bounds (1-%d)", start, end, max)
+			}
+			for i := start; i <= end; i++ {
+				selected[i] = true
+			}
+			continue
+		}
+
+		idx, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid selection '%s'", part)
+		}
+		if idx < 1 || idx > max {
+			return nil, fmt.Errorf("selection %d is out of bounds (1-%d)", idx, max)
+		}
+		selected[idx] = true
+	}
+
+	return selected, nil
+}
+
+func promptSelection(reader *bufio.Reader, prompt string, max int) map[int]bool {
+	if max <= 0 {
+		return map[int]bool{}
+	}
+
+	for {
+		fmt.Print(prompt)
+		input, _ := reader.ReadString('\n')
+
+		selected, err := parseSelectionInput(input, max)
+		if err != nil {
+			fmt.Printf("❌ %v\n", err)
+			continue
+		}
+		return selected
+	}
+}
+
+func promptPurgeOptions(guilds []Guild, dmChannels []Channel) PurgeOptions {
+	options := PurgeOptions{
+		ExcludedGuildIDs:     make(map[string]bool),
+		ExcludedDMChannelIDs: make(map[string]bool),
+	}
+
+	fmt.Println("🧭 Optional scope selection")
+	fmt.Println("By default, the purge covers everything reachable on your account.")
+	fmt.Println("You can exclude specific servers and DM/group DM channels before starting.")
+	fmt.Println()
+
+	reader := bufio.NewReader(os.Stdin)
+
+	if len(guilds) > 0 {
+		fmt.Println("Servers:")
+		for i, guild := range guilds {
+			fmt.Printf("  [%d] %s (ID: %s)\n", i+1, displayGuildName(guild), guild.ID)
+		}
+		fmt.Println()
+
+		selectedGuilds := promptSelection(
+			reader,
+			"Enter server numbers to EXCLUDE (e.g. 1,3-5) or press Enter for none: ",
+			len(guilds),
+		)
+		for i, guild := range guilds {
+			if selectedGuilds[i+1] {
+				options.ExcludedGuildIDs[guild.ID] = true
+			}
+		}
+	} else {
+		fmt.Println("No servers found to list for exclusion.")
+	}
+
+	fmt.Println()
+
+	if len(dmChannels) > 0 {
+		fmt.Println("Open DM / Group DM channels:")
+		for i, ch := range dmChannels {
+			channelKind := "DM"
+			if ch.Type == ChannelTypeGroupDM {
+				channelKind = "Group DM"
+			}
+			fmt.Printf("  [%d] %s: %s (ID: %s)\n", i+1, channelKind, describeChannel(ch), ch.ID)
+		}
+		fmt.Println()
+
+		selectedDMs := promptSelection(
+			reader,
+			"Enter DM/channel numbers to EXCLUDE (e.g. 2,4-6) or press Enter for none: ",
+			len(dmChannels),
+		)
+		for i, ch := range dmChannels {
+			if selectedDMs[i+1] {
+				options.ExcludedDMChannelIDs[ch.ID] = true
+			}
+		}
+	} else {
+		fmt.Println("No open DM channels found to list for exclusion.")
+	}
+
+	fmt.Println()
+	fmt.Printf(
+		"✅ Exclusions selected: %d servers, %d DM/group DM channels.\n",
+		len(options.ExcludedGuildIDs),
+		len(options.ExcludedDMChannelIDs),
+	)
+	if len(options.ExcludedGuildIDs) > 0 || len(options.ExcludedDMChannelIDs) > 0 {
+		fmt.Println("   Excluded items will be skipped during message deletion and reaction removal.")
+	}
+	fmt.Println()
+
+	return options
+}
+
 // =============================================================================
 // User interaction
 // =============================================================================
@@ -1611,6 +1842,32 @@ func main() {
 	fmt.Printf("✅ Authenticated as: %s (ID: %s)\n", client.username, client.userID)
 	fmt.Println()
 
+	purgeOptions := PurgeOptions{
+		ExcludedGuildIDs:     make(map[string]bool),
+		ExcludedDMChannelIDs: make(map[string]bool),
+	}
+
+	fmt.Println("📋 Loading servers and DM channels...")
+	selectionGuilds, guildErr := client.GetAllGuilds()
+	if guildErr != nil {
+		fmt.Printf("⚠️  Could not load server list for exclusions: %v\n", guildErr)
+		selectionGuilds = []Guild{}
+	}
+
+	selectionDMs, dmErr := client.GetDMChannels()
+	if dmErr != nil {
+		fmt.Printf("⚠️  Could not load DM channel list for exclusions: %v\n", dmErr)
+		selectionDMs = []Channel{}
+	}
+
+	if guildErr == nil || dmErr == nil {
+		fmt.Println()
+		purgeOptions = promptPurgeOptions(selectionGuilds, selectionDMs)
+	} else {
+		fmt.Println("⚠️  Exclusion selection unavailable; continuing with full deletion scope.")
+		fmt.Println()
+	}
+
 	// Confirmation
 	if !confirmDeletion() {
 		fmt.Println("Operation cancelled.")
@@ -1622,7 +1879,7 @@ func main() {
 	fmt.Println("You can press Ctrl+C at any time to stop. Already-deleted messages stay deleted.")
 	fmt.Println()
 
-	stats := client.PurgeAll(dataPackagePath)
+	stats := client.PurgeAll(dataPackagePath, purgeOptions)
 
 	// Ask if user wants to remove friends and leave servers
 	fmt.Println()
@@ -1697,7 +1954,8 @@ func confirmDeletion() bool {
 	fmt.Println("║  ⚠️  WARNING — DESTRUCTIVE ACTION                   ║")
 	fmt.Println("╠══════════════════════════════════════════════════════╣")
 	fmt.Println("║                                                     ║")
-	fmt.Println("║  This will DELETE ALL messages you have ever sent:  ║")
+	fmt.Println("║  This will DELETE your messages and reactions across ║")
+	fmt.Println("║  Discord (except any exclusions you selected):       ║")
 	fmt.Println("║                                                     ║")
 	fmt.Println("║    • All messages in ALL servers                    ║")
 	fmt.Println("║    • All threads (public & private)                 ║")

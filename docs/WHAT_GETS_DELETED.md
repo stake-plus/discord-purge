@@ -1,7 +1,8 @@
 # What Gets Deleted
 
 This document describes in detail exactly what `discord-purge` removes from your
-Discord account and how the deletion process works.
+Discord account and how the deletion process works. If you use the interactive
+scope selector, excluded servers/DM channels are skipped.
 
 ---
 
@@ -13,8 +14,8 @@ recycle bin, no backup. Once a message is deleted via the API, it is erased from
 Discord's servers.
 
 **Before running this tool, understand:**
-- Every message you have ever sent on Discord will be deleted
-- Every reaction you have ever placed on anyone's message will be removed
+- Every non-excluded message you have ever sent on Discord will be deleted
+- Every non-excluded reaction you have ever placed on anyone's message will be removed
 - This includes messages and reactions from years ago
 - This includes messages in servers you are still active in
 - This cannot be reversed under any circumstances

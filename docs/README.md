@@ -216,9 +216,23 @@ export DISCORD_TOKEN="your_token_here"
 |----------|-------------|
 | `DISCORD_TOKEN` | If set, the tool uses this token instead of prompting |
 
+### Optional Scope Selection (Interactive)
+
+After authentication, the tool loads and displays:
+
+- Your current server list
+- Your currently visible DM/group DM channels
+
+You can enter item numbers to exclude specific servers and/or DM channels from
+message deletion and reaction removal. Press Enter to keep the default (process
+everything).
+
 ---
 
 ## What Gets Deleted
+
+Unless you exclude specific items in the interactive scope selector, the tool
+removes the following:
 
 | Content | How |
 |---------|-----|
